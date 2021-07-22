@@ -1,0 +1,240 @@
+---
+title: "Functional Analysis Workshop"
+author: "Grzegorz Mrukwa"
+date: "18/07/2021"
+output: html_document
+fig_align: "center"
+---
+
+# Load libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(cowplot)
+library(tmod)
+library(colorDF)
+library(DESeq2)
+library(msigdbr)
+```
+
+# Load data
+
+```{r}
+counts <- readRDS("data/counts.rds")
+covar <- readRDS("data/covar.rds")
+annot <- readRDS("data/annot.rds")
+```
+
+# Build linear model
+
+```{r}
+ds2 <- DESeqDataSetFromMatrix(countData=counts, 
+                              colData=covar,
+                              design= ~ group)
+ds2 <- DESeq(ds2)
+```
+
+# Comparison
+
+We extract coefficients of the one-vs-one-models which show us the differences between healthy specimens and specific diseases, to compare the change with respect to healthy baseline. We plot logarithm of fold change ratio to check which genes seem concordant (Q1, Q3), and which seem discordant (Q2, Q4).
+
+```{r}
+res_other <- results(ds2, name="group_other_vs_no")
+res_other <- as.data.frame(res_other)
+res_SC2   <- results(ds2, name="group_SC2_vs_no")
+res_SC2 <- as.data.frame(res_SC2)
+res_merged <- merge(res_other, res_SC2, by=0, 
+                    suffixes = c(".other", ".SC2"))
+ggplot(res_merged, aes(x=log2FoldChange.other, y=log2FoldChange.SC2)) +
+  geom_point() + geom_hline(yintercept=0) + geom_vline(xintercept=0)
+```
+We can also check, how correlated is the change from the healthy condition. Although, correlation usefulness is rather limited, as in most cases test will yield statistically significant. Correlation closer to 1 means more concordant genes, closer to -1 means more discordant.
+
+```{r}
+cor.test(res_merged$log2FoldChange.other, res_merged$log2FoldChange.SC2)
+```
+
+# Annotating genes from the comparison
+
+This is to resolve the genes from IDs to specific information.
+
+```{r}
+res_other <- merge(annot, res_other, by.x="PrimaryID", by.y=0)
+res_other <- res_other %>% arrange(padj)
+res_SC2 <- merge(annot, res_SC2, by.x="PrimaryID", by.y=0)
+res_SC2 <- res_SC2 %>% arrange(padj)
+```
+
+# Plotting sample gene
+
+The second most significant gene for SARS-CoV-2 (and the third most significant for `other` class) is plotted below:
+
+```{r}
+norm_counts <- assay(vst(ds2))
+
+plot_gene <- function(id, expr, covariate) {
+
+  df <- data.frame(Expression=expr[id, ], Covariate=covariate)
+  ggplot(df, aes(x=Covariate, y=Expression)) + 
+    geom_boxplot() +
+    geom_jitter(width = .2)
+}
+
+plot_gene("ENSG00000185745", norm_counts, covar$group)
+```
+
+# Gene set enrichment
+
+These are tests to find the differentially expressed gene sets from the known databases.
+
+## Hypergeometric test and CERNO
+
+Here we require an arbitrarily chosen threshold of significance `0.001` and at least twofold change in gene expression to consider a gene usefulness for a gene set in detecting a disease.
+
+```{r}
+## Hypergeometric test
+## define the "foreground" set
+pval_thr <- 1e-3 # define the p value threshold
+lfc_thr  <- 1    # define the LFC threshold
+sel <- abs(res_other$log2FoldChange) > lfc_thr &
+       res_other$padj < pval_thr
+
+fg <- res_other$SYMBOL[sel]
+bg <- res_other$SYMBOL
+
+hg_res_other <- tmodHGtest(fg=fg, bg=bg)
+
+## CERNO
+gg <- res_other$SYMBOL[ order(res_other$pvalue) ]
+ce_res_other <- tmodCERNOtest(gg)
+```
+
+We sort by the p-value instead of adjusted p-value, since adjusted p-value is monotonic on p-value and it will not change the order. However, adjusted p-value sometimes has a lower resolution (2 different p-values may have the same adjusted p-value due to numerical artifacts).
+
+```{r}
+## Hypergeometric test
+sel <- abs(res_SC2$log2FoldChange) > lfc_thr &
+       res_SC2$padj < pval_thr
+
+fg <- res_SC2$SYMBOL[sel]
+bg <- res_SC2$SYMBOL
+
+hg_res_SC2 <- tmodHGtest(fg=fg, bg=bg)
+
+## CERNO
+gg <- res_SC2$SYMBOL[ order(res_SC2$pvalue) ]
+ce_res_SC2 <- tmodCERNOtest(gg)
+```
+
+And now we compare the differences between enrichment for "other" disease and SARS-CoV-2. The plot below shows just the order of magnitude of the change.
+
+```{r, fig.height = 11, fig.width = 9}
+res <- list(other=ce_res_other, SC2=ce_res_SC2)
+tmodPanelPlot(res, filter.rows.pval = 1e-3)
+```
+
+As we have all genes together before the enrichment, to get differentially expressed ones, we need to review whether there's concordance or discordance between groups:
+
+```{r, fig.height = 11, fig.width = 9}
+res_merged <- merge(res_other, res_SC2, 
+  by=c("PrimaryID", "ENSEMBL", "SYMBOL") , suffixes=c(".other", ".SC2"))
+lfcs <- res_merged[ , c("log2FoldChange.other", "log2FoldChange.SC2") ]
+pvals <- res_merged[ , c("padj.other", "padj.SC2") ]
+pie <- tmodDecideTests(res_merged$SYMBOL, lfc = lfcs, pval=pvals)
+names(pie) <- names(res)
+tmodPanelPlot(res, filter.rows.pval = 1e-3, pie=pie, grid="b")
+```
+
+Blue indicates drop in the gene expression level, red -- increase.
+
+## What's the evidence for a gene set to differentiate?
+
+Then, to show whether a specific gene set is justified to be claimed differentiating, one may check effect size related with that gene set. It is equivalent to area under the ROC curve of a gene set, ordered by the p-values. If there's a dense group of genes with high differentiating potential, it brings AUC closer to 1.
+
+Here we inspect effect size of the group with ID `LI.M75` (antiviral IFN signature) for SARS-CoV-2 vs no disease:
+
+```{r}
+gg <- res_SC2$SYMBOL[ order(res_SC2$pvalue) ]
+evidencePlot(gg, m="LI.M75", gene.labels=TRUE)
+```
+
+From the previous plot we could already suspect that the AUC could be close to 1. On the contrary, group with ID `LI.M37.0` (immune activation - generic cluster) has AUC much closer to 0.5.
+
+```{r}
+gg <- res_SC2$SYMBOL[ order(res_SC2$pvalue) ]
+evidencePlot(gg, m="LI.M37.0", gene.labels=TRUE)
+```
+
+## Down the gene set
+
+Finally, we go down the gene set `LI.M75` to the actual genes, to see if these are differentially expressed between SARS-CoV-2 and no disease.
+
+```{r}
+mm <- getModuleMembers("LI.M75")[[1]]
+sel <- res_SC2[ res_SC2$SYMBOL %in% mm, ][["PrimaryID"]]
+plots <- lapply(sel[1:4], plot_gene, expr=norm_counts, covariate=covar$group)
+plot_grid(plotlist=plots, ncol=2)
+```
+
+As one can see, these genes are upregulated in SARS-CoV-2 as compared to no disease.
+
+## Eigengene
+
+Instead of checking genes from a gene set one-by-one, one can alternatively compute eigengene (first PCA component) of the gene set and check its distribution:
+
+```{r}
+eig <- eigengene(norm_counts, annot$SYMBOL)
+df <- data.frame(covar, eigengene=eig[ "LI.M75", ])
+ggplot(df, aes(x=group, y=eigengene)) + 
+  geom_boxplot() +
+  geom_jitter(width=.3)
+```
+
+## Upset plot
+
+Now, we may want to check, how many genes are shared between gene sets that were found relevant with CERNO. Sets connected with vertical line share the number of genes indicated in the plot.
+
+```{r, fig.height = 11, fig.width = 9, message=FALSE, warning=FALSE}
+upset(ce_res_SC2$ID[1:20])
+```
+
+<!-- ## Using Gene Ontology gene sets -->
+
+<!-- ```{r} -->
+<!-- library(msigdbr) -->
+<!-- mdf <- msigdbr(species = "Homo sapiens") -->
+<!-- go <- mdf[ mdf$gs_subcat == "GO:BP", ] -->
+<!-- go_mset <- makeTmodFromDataFrame(go, feature_col = "gene_symbol", -->
+<!--                                  module_col = "gs_id", -->
+<!--                                  title_col = "gs_name") -->
+<!-- gg <- res_SC2$SYMBOL[ order(res_SC2$pvalue) ] -->
+<!-- tmodCERNOtest(gg, mset=go_mset) -->
+<!-- ``` -->
+
+<!-- These gene sets contain lots of genes, but provide relatively low effect size. Such information is redundant and can be confirmed with evidence plots. -->
+
+<!-- ```{r} -->
+<!-- evidencePlot(gg, m="M3458", mset=go_mset) -->
+<!-- ``` -->
+<!-- ```{r} -->
+<!-- N <- sapply(go_mset$MODULES2GENES, length) -->
+<!-- sel <- names(N)[ N >= 5 & N <= 50 ] -->
+<!-- go <- go[ go$gs_id %in% sel, ] -->
+<!-- go_mset <- makeTmodFromDataFrame(go, feature_col = "gene_symbol", -->
+<!--                                  module_col = "gs_id", -->
+<!--                                  title_col = "gs_name") -->
+<!-- tmodCERNOtest(gg, mset=go_mset) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- evidencePlot(gg, m="M11929", mset=go_mset, gene.labels=TRUE) -->
+<!-- ``` -->
+
+# Show package versions
+
+This is to provide the information about packages that were used for computations.
+
+```{r}
+sessionInfo()
+```
